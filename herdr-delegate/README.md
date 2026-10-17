@@ -20,7 +20,7 @@ It works with Claude Code and Codex as orchestrators, and with Claude, Codex and
 - **`SKILL.md`.** The agent-facing instructions: when to delegate, which tier to pick, and the plan → brief → spawn → review → close loop. It also says to review the actual diff rather than trust the helper's report.
 - **`scripts/delegate`.** One CLI that does the plumbing:
   - opens a `subagents` tab in the caller's space and starts the agent with the right model and effort;
-  - gets past startup prompts (folder trust, Codex update);
+  - pre-trusts the folder and starts helpers in auto-approval mode (Claude auto mode, Codex `--approve-for-me`), and dismisses the Codex update prompt;
   - sends the brief, waits, and returns the helper's Markdown report.
 - **`scripts/usage.py`.** Usage-aware routing. It reads Claude Code's 5-hour and 7-day limits and Codex's limits, and keeps GPT working as a steady *supplement* to Claude instead of a fallback that only kicks in once you run out.
 - **`plugin/`.** A Herdr plugin (`herdr-delegate.tree`) that draws the tree in the Agents panel, plus a `prefix+a` popup listing every helper live.

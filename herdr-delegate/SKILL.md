@@ -77,7 +77,7 @@ Names follow `[a-z][a-z0-9_-]{0,31}` and must be unique across the Herdr server,
 - `3` means the child is **blocked** or stalled; its screen is printed to stderr. Usually this is a permission or approval dialog. If it's within the brief's scope and harmless, answer it with `herdr agent send-keys <name> ...`. If it's destructive or outside the scope, ask the user. Never blindly resend the prompt.
 - `4` means a timeout. The child may still be working, so check `herdr agent get <name>` before acting.
 
-Startup handles Claude's folder-trust prompt and Codex's update prompt by itself.
+Helpers start pre-trusted in their cwd and in auto-approval mode (Claude `--permission-mode auto`, Codex `--approve-for-me`), so trust and routine permission prompts should not block them. Startup also dismisses Codex's update prompt.
 
 ## Lean helpers and the sidebar tree
 

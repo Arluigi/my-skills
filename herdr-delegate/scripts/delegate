@@ -78,20 +78,46 @@ alloc_pane() {
 agent_args() { # kind model effort → native CLI args, one per line
   case "$1" in
     claude) echo "--model"; echo "$2"; [ -n "$3" ] && { echo "--effort"; echo "$3"; }
+            echo "--permission-mode"; echo "auto" # classifier approvals, no prompts
             echo "--disallowed-tools"; echo "Agent" # no native subagents either
             echo "--settings"; echo "$HELPER_SETTINGS" ;;
     codex)  echo "-m"; echo "$2"; echo "-c"; echo "check_for_update_on_startup=false"
-            [ -n "$3" ] && { echo "-c"; echo "model_reasoning_effort=$3"; } ;;
+            [ -n "$3" ] && { echo "-c"; echo "model_reasoning_effort=$3"; }
+            # Codex's auto mode: approvals go to its reviewer, not to a human.
+            # The report lives outside the workspace, so make it writable too.
+            echo "--approve-for-me"; echo "--add-dir"; echo "$RESULT_DIR" ;;
     gemini) [ -n "$2" ] && { echo "-m"; echo "$2"; } ;;
     *)      [ -n "$2" ] && { echo "--model"; echo "$2"; } ;;
   esac
 }
 
+# Both CLIs stop on a "trust this folder?" screen the first time they open a
+# directory. The orchestrator already works there, so record the trust up front.
+# Codex looks trust up by git root as well as cwd.
+pretrust() { # kind cwd
+  local cwd="$2" root dir tmp
+  case "$1" in
+    claude)
+      local cfg="$HOME/.claude.json"
+      [ -f "$cfg" ] || return 0
+      [ "$(jq -r --arg d "$cwd" '.projects[$d].hasTrustDialogAccepted // false' "$cfg")" = true ] && return 0
+      tmp=$(mktemp "$cfg.XXXXXX") &&
+        jq --arg d "$cwd" '.projects[$d] = ((.projects[$d] // {}) + {hasTrustDialogAccepted: true})' "$cfg" >"$tmp" &&
+        mv "$tmp" "$cfg" || rm -f "$tmp" ;;
+    codex)
+      local cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
+      root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
+      for dir in "$cwd" ${root:+"$root"}; do
+        grep -qsF "[projects.\"$dir\"]" "$cfg" ||
+          printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$dir" >>"$cfg"
+      done ;;
+  esac
+}
+
 screen() { herdr agent read "$1" --source recent-unwrapped --lines "${2:-40}" 2>/dev/null | tail -n "${2:-40}"; }
 
-# Claude asks "Do you trust this folder?" the first time it opens a directory.
-# The orchestrator already works in that cwd, so accept it once.
-# Session-start hooks can also hold an agent in "working"/"unknown" for a while,
+# pretrust should prevent trust screens; if one still shows, accept the default
+# (first) option, which is "yes" in both CLIs. Session-start hooks can also hold an agent in "working"/"unknown" for a while,
 # so poll until it settles instead of trusting `agent start`'s verdict.
 wait_ready() {
   local name="$1" i st
@@ -101,8 +127,8 @@ wait_ready() {
       idle|done) return 0 ;;
       blocked)
         local s; s=$(herdr agent read "$name" --source visible 2>/dev/null)
-        if grep -q "Yes, I trust this folder" <<<"$s"; then
-          herdr agent send-keys "$name" down enter >/dev/null
+        if grep -qE "Yes, I trust this folder|trust the contents of this directory" <<<"$s"; then
+          herdr agent send-keys "$name" enter >/dev/null
         elif grep -q "Update available" <<<"$s"; then
           herdr agent send-keys "$name" esc >/dev/null # never self-update a child
         else
@@ -187,6 +213,7 @@ cmd_spawn() {
   IFS=: read -r kind model effort <<<"$resolved"
   [ -n "$kind" ] || die "bad spec $spec"
 
+  pretrust "$kind" "$cwd"
   local pane; pane=$(alloc_pane "$cwd")
   [ -n "$pane" ] && [ "$pane" != null ] || die "could not allocate a pane"
 
