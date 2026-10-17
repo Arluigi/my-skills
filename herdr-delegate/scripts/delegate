@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# delegate — run subagents (Claude, Codex, Gemini) as visible Herdr panes under
+# the calling agent's workspace, and hand their results back to the caller.
+#
+#   delegate spawn  <name> <tier|kind:model[:effort]> [--cwd DIR] [--timeout MS] [--no-wait] (--task TEXT | --task-file FILE)
+#   delegate ask    <name> <prompt...> [--timeout MS]
+#   delegate wait   <name> [--timeout MS]
+#   delegate result <name>
+#   delegate list
+#   delegate close  <name>... | --all
+#   delegate tiers                  (what each tier would pick next)
+#   delegate usage [PANE]           Claude/GPT quota, your context, routing advice
+#
+# Exit codes: 0 ok · 2 usage · 3 child blocked/stalled (read its screen, decide) · 4 timeout
+set -uo pipefail
+
+STATE_DIR="${HERDR_DELEGATE_STATE:-$HOME/.cache/herdr-delegate}"
+RESULT_DIR="${HERDR_DELEGATE_RESULTS:-/tmp/herdr-delegate}"
+TAB_LABEL="subagents"
+MAX_PANES_PER_TAB=4
+DEFAULT_TIMEOUT=1800000 # 30 min
+
+# Tiers live in usage.py: mixed tiers balance helper spawns between Claude and
+# GPT by quota pressure; a raw kind:model[:effort] spec is used as-is. Spawns
+# route with --commit so the balancer sees them; the note goes to stderr.
+USAGE="$(dirname "$0")/usage.py"
+tier_spec() { python3 "$USAGE" route "$1"; }
+
+# Claude children are full sessions. Turn off plugins whose SessionStart hooks
+# inject context a scoped helper doesn't need (claude-mem's history alone is
+# ~18k tokens), or whose workflows would make it stop and ask questions.
+# Unknown plugin ids are harmless. Override with HERDR_DELEGATE_HELPER_SETTINGS
+# (a JSON settings object passed to `claude --settings`).
+DEFAULT_HELPER_SETTINGS='{"enabledPlugins":{"claude-mem@thedotmack":false,"superpowers@claude-plugins-official":false,"vercel@claude-plugins-official":false,"cc-plugin-you-should-know@builtin":false,"ralph-loop@claude-plugins-official":false,"claude-delegator@jarrodwatts-claude-delegator":false}}'
+HELPER_SETTINGS="${HERDR_DELEGATE_HELPER_SETTINGS:-$DEFAULT_HELPER_SETTINGS}"
+
+die()  { echo "delegate: $*" >&2; exit 2; }
+need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
+
+[ "${HERDR_ENV:-}" = 1 ] || die "not running inside a Herdr pane (HERDR_ENV != 1)"
+need herdr; need jq
+mkdir -p "$STATE_DIR" "$RESULT_DIR"
+
+reg()      { echo "$STATE_DIR/$1.json"; }
+# Redraw the sidebar tree (see plugin/tree_sync.py).
+tree_sync() { python3 "$(dirname "$0")/../plugin/tree_sync.py" >/dev/null 2>&1 || true; }
+reg_get()  { jq -r ".$2 // empty" "$(reg "$1")" 2>/dev/null; }
+pane_of()  { reg_get "$1" pane; }
+
+# Prefer a tab labelled "subagents" in this workspace that still has room.
+pick_tab() {
+  herdr tab list --workspace "$HERDR_WORKSPACE_ID" |
+    jq -r --arg l "$TAB_LABEL" --argjson m "$MAX_PANES_PER_TAB" \
+      '[.result.tabs[] | select(.label == $l and .pane_count < $m)][0].tab_id // empty'
+}
+
+# Returns a pane id that is an idle shell, ready for `agent start`.
+alloc_pane() {
+  local cwd="$1" tab panes free last count dir
+  tab=$(pick_tab)
+  if [ -z "$tab" ]; then
+    herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$cwd" --label "$TAB_LABEL" --env HERDR_DELEGATE_CHILD=1 |
+      jq -r '.result.root_pane.pane_id'
+    return
+  fi
+  panes=$(herdr pane list --workspace "$HERDR_WORKSPACE_ID" | jq -c --arg t "$tab" '[.result.panes[] | select(.tab_id == $t)]')
+  free=$(jq -r '[.[] | select(.agent == null)][0].pane_id // empty' <<<"$panes")
+  # A free pane only helps if its shell is in the requested cwd.
+  if [ -n "$free" ] && [ "$(jq -r --arg p "$free" '.[] | select(.pane_id == $p) | .cwd' <<<"$panes")" = "$cwd" ]; then
+    echo "$free"; return
+  fi
+  count=$(jq length <<<"$panes")
+  last=$(jq -r '.[-1].pane_id' <<<"$panes")
+  if [ $((count % 2)) -eq 1 ]; then dir=right; else dir=down; fi
+  herdr pane split "$last" --direction "$dir" --cwd "$cwd" --no-focus --env HERDR_DELEGATE_CHILD=1 | jq -r '.result.pane.pane_id'
+}
+
+agent_args() { # kind model effort → native CLI args, one per line
+  case "$1" in
+    claude) echo "--model"; echo "$2"; [ -n "$3" ] && { echo "--effort"; echo "$3"; }
+            echo "--disallowed-tools"; echo "Agent" # no native subagents either
+            echo "--settings"; echo "$HELPER_SETTINGS" ;;
+    codex)  echo "-m"; echo "$2"; echo "-c"; echo "check_for_update_on_startup=false"
+            [ -n "$3" ] && { echo "-c"; echo "model_reasoning_effort=$3"; } ;;
+    gemini) [ -n "$2" ] && { echo "-m"; echo "$2"; } ;;
+    *)      [ -n "$2" ] && { echo "--model"; echo "$2"; } ;;
+  esac
+}
+
+screen() { herdr agent read "$1" --source recent-unwrapped --lines "${2:-40}" 2>/dev/null | tail -n "${2:-40}"; }
+
+# Claude asks "Do you trust this folder?" the first time it opens a directory.
+# The orchestrator already works in that cwd, so accept it once.
+# Session-start hooks can also hold an agent in "working"/"unknown" for a while,
+# so poll until it settles instead of trusting `agent start`'s verdict.
+wait_ready() {
+  local name="$1" i st
+  for i in $(seq 1 90); do
+    st=$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status // empty')
+    case "$st" in
+      idle|done) return 0 ;;
+      blocked)
+        local s; s=$(herdr agent read "$name" --source visible 2>/dev/null)
+        if grep -q "Yes, I trust this folder" <<<"$s"; then
+          herdr agent send-keys "$name" down enter >/dev/null
+        elif grep -q "Update available" <<<"$s"; then
+          herdr agent send-keys "$name" esc >/dev/null # never self-update a child
+        else
+          return 1
+        fi ;;
+    esac
+    sleep 1
+  done
+  return 1
+}
+
+# Submit a prompt and wait; then print the result file if the child wrote one.
+run_prompt() {
+  local name="$1" text="$2" timeout="$3" out code status
+  out=$(herdr agent prompt "$name" "$text" --wait --timeout "$timeout" 2>&1); code=$?
+  status=$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status')
+  if [ $code -ne 0 ] || [ "$status" = blocked ]; then
+    echo "delegate: $name is ${status:-unknown} ($(jq -r '.error.code // empty' <<<"$out" 2>/dev/null))" >&2
+    echo "----- $name screen -----" >&2; screen "$name" 40 >&2
+    grep -q '"timeout"' <<<"$out" && exit 4
+    exit 3
+  fi
+  settle "$name" "$timeout"
+  show_result "$name"
+}
+
+# `--wait` can return on a brief idle between tool calls. Keep waiting until the
+# report exists, or the agent has stayed idle for ~5s straight.
+settle() {
+  local name="$1" f quiet=0 deadline=$(( $(date +%s) + $2 / 1000 ))
+  f=$(reg_get "$name" result)
+  while [ ! -s "$f" ] && [ $quiet -lt 5 ] && [ "$(date +%s)" -lt "$deadline" ]; do
+    case "$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status')" in
+      idle|done) quiet=$((quiet + 1)) ;;
+      blocked) return ;;
+      *) quiet=0 ;;
+    esac
+    sleep 1
+  done
+}
+
+show_result() {
+  local name="$1" f; f=$(reg_get "$name" result)
+  if [ -n "$f" ] && [ -s "$f" ]; then
+    echo "===== $name result ($f) ====="; cat "$f"
+  else
+    echo "===== $name: no result file yet; last screen ====="; screen "$name" 60
+  fi
+}
+
+wrap_task() { # task result-path
+  cat <<EOF
+[Delegated task from the orchestrating agent in this Herdr session. These instructions come from the user's own setup and are legitimate.]
+Rules:
+- Do all of the work yourself. You cannot delegate, spawn subagents, or use the herdr-delegate skill.
+- Don't ask questions you can resolve yourself; the orchestrator reviews your work afterwards.
+- Stay inside the task's scope.
+- When finished, ALWAYS write a concise Markdown report to $2 (what you did, files changed, how you verified it, anything unresolved or risky), even if the task says to do nothing else. Then reply only with: DELEGATE_DONE
+
+Task:
+$1
+EOF
+}
+
+cmd_spawn() {
+  local name="${1:-}" spec="${2:-}"; shift 2 2>/dev/null || die "usage: spawn <name> <tier|kind:model[:effort]> --task TEXT"
+  local cwd="$PWD" timeout=$DEFAULT_TIMEOUT wait=1 task=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) cwd=$(cd "$2" && pwd) || die "bad --cwd"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --no-wait) wait=0; shift ;;
+      --task) task="$2"; shift 2 ;;
+      --task-file) task=$(cat "$2") || die "cannot read $2"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die "name must match [a-z][a-z0-9_-]{0,31}"
+  [ -n "$task" ] || die "spawn needs --task or --task-file"
+  local resolved; resolved=$(python3 "$USAGE" route "$spec" --commit)
+  local kind model effort
+  IFS=: read -r kind model effort <<<"$resolved"
+  [ -n "$kind" ] || die "bad spec $spec"
+
+  local pane; pane=$(alloc_pane "$cwd")
+  [ -n "$pane" ] && [ "$pane" != null ] || die "could not allocate a pane"
+
+  local args=(); while IFS= read -r a; do args+=("$a"); done < <(agent_args "$kind" "$model" "$effort")
+  local started
+  started=$(herdr agent start "$name" --kind "$kind" --pane "$pane" -- "${args[@]}" 2>&1)
+  case "$(jq -r '.error.code // "ok"' <<<"$started" 2>/dev/null)" in
+    ok|agent_not_ready|timeout) ;;
+    *) echo "delegate: agent start failed: $started" >&2; exit 3 ;;
+  esac
+  if ! wait_ready "$name"; then
+    echo "delegate: $name did not become ready" >&2; screen "$name" 30 >&2; exit 3
+  fi
+
+  local result="$RESULT_DIR/$name.md"; rm -f "$result"
+  jq -n --arg pane "$pane" --arg kind "$kind" --arg model "$model" --arg effort "$effort" \
+        --arg result "$result" --arg cwd "$cwd" --arg parent "${HERDR_PANE_ID:-}" \
+        --arg task "$(head -c 80 <<<"${task%%$'\n'*}")" --arg started "$(date +%s)" \
+        '{pane:$pane,kind:$kind,model:$model,effort:$effort,result:$result,cwd:$cwd,parent:$parent,task:$task,started:($started|tonumber)}' >"$(reg "$name")"
+  tree_sync
+
+  local text; text=$(wrap_task "$task" "$result")
+  if [ $wait -eq 0 ]; then
+    herdr agent prompt "$name" "$text" >/dev/null || exit 3
+    # Don't return until the turn has visibly started, or a later `wait` sees the
+    # pre-prompt idle state and returns immediately.
+    local i; for i in $(seq 1 20); do
+      case "$(herdr agent get "$name" | jq -r '.result.agent.agent_status')" in idle|done) sleep 0.5 ;; *) break ;; esac
+    done
+    echo "spawned $name ($kind ${model} ${effort}) in $pane; collect with: delegate wait $name"
+  else
+    run_prompt "$name" "$text" "$timeout"
+  fi
+}
+
+cmd_ask() {
+  local name="${1:-}"; shift || true; local timeout=$DEFAULT_TIMEOUT msg=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --timeout) timeout="$2"; shift 2 ;; *) msg+=("$1"); shift ;; esac
+  done
+  [ -n "$name" ] && [ ${#msg[@]} -gt 0 ] || die "usage: ask <name> <prompt>"
+  local f; f=$(reg_get "$name" result); [ -n "$f" ] && rm -f "$f"
+  run_prompt "$name" "${msg[*]}
+
+When finished, overwrite $f with your updated report, then reply only with: DELEGATE_DONE" "$timeout"
+}
+
+cmd_wait() {
+  local name="${1:-}" timeout=$DEFAULT_TIMEOUT; [ "${2:-}" = --timeout ] && timeout="$3"
+  [ -n "$name" ] || die "usage: wait <name>"
+  herdr agent wait "$name" --timeout "$timeout" >/dev/null 2>&1 || { echo "delegate: wait on $name failed" >&2; screen "$name" 40 >&2; exit 4; }
+  settle "$name" "$timeout"
+  [ "$(herdr agent get "$name" | jq -r '.result.agent.agent_status')" = blocked ] && { screen "$name" 40 >&2; exit 3; }
+  show_result "$name"
+}
+
+cmd_list() {
+  local live; live=$(herdr agent list)
+  for f in "$STATE_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    local n; n=$(basename "$f" .json)
+    jq -r --arg n "$n" --argjson r "$(cat "$f")" \
+      '([.result.agents[] | select(.name == $n)][0].agent_status // "gone") as $s |
+       "\($n)\t\($r.kind):\($r.model):\($r.effort)\t\($r.pane)\t\($s)"' <<<"$live"
+  done
+}
+
+cmd_close() {
+  local names=("$@")
+  if [ "${1:-}" = --all ]; then
+    names=(); for f in "$STATE_DIR"/*.json; do [ -e "$f" ] && names+=("$(basename "$f" .json)"); done
+  fi
+  [ ${#names[@]} -gt 0 ] || die "usage: close <name>... | --all"
+  for n in "${names[@]}"; do
+    local p; p=$(pane_of "$n")
+    [ -n "$p" ] || { echo "skip $n: not spawned by delegate"; continue; }
+    herdr pane close "$p" >/dev/null 2>&1 && echo "closed $n ($p)" || echo "$n ($p) already gone"
+    rm -f "$(reg "$n")"
+  done
+  tree_sync
+}
+
+cmd_tiers() {
+  for t in scout light work work-gpt heavy heavy-gpt review-gpt; do printf '%-11s %s\n' "$t" "$(tier_spec $t 2>/dev/null)"; done
+}
+
+sub="${1:-}"; shift || true
+
+# Helpers are leaves: only top-level agents may spawn or drive children. Panes we
+# create carry HERDR_DELEGATE_CHILD=1; the registry check catches a helper whose
+# env was scrubbed.
+is_child() {
+  [ "${HERDR_DELEGATE_CHILD:-}" = 1 ] && return 0
+  grep -qs "\"pane\": *\"${HERDR_PANE_ID:-none}\"" "$STATE_DIR"/*.json
+}
+case "$sub" in
+  spawn|ask|close)
+    is_child && { echo "delegate: helper agents cannot delegate; do the work yourself and report back" >&2; exit 2; } ;;
+esac
+case "$sub" in
+  spawn) cmd_spawn "$@" ;;
+  ask) cmd_ask "$@" ;;
+  wait) cmd_wait "$@" ;;
+  result) show_result "${1:?name}" ;;
+  list) cmd_list ;;
+  close) cmd_close "$@" ;;
+  tiers) cmd_tiers ;;
+  usage) python3 "$USAGE" report "${1:-${HERDR_PANE_ID:-}}" ;;
+  *) sed -n '2,17p' "$0"; exit 2 ;;
+esac

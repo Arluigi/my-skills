@@ -1,0 +1,49 @@
+# herdr-delegate: paste into ~/.config/herdr/config.toml, then `herdr server reload-config`.
+# If you already have a [ui] table, move tab_bar_right into it.
+
+# Live quota readout in the tab bar (the router uses the same numbers).
+[ui]
+tab_bar_right = [
+  { type = "command", command = "python3 ~/.claude/skills/herdr-delegate/scripts/usage.py bar", interval_seconds = 60, timeout_seconds = 5 },
+]
+
+# Agents panel as a tree. Top-level agents get a "$space · $tabl" header;
+# delegate children have no header, so they render as
+#   ├─ ● name
+#   │      model/effort
+# under their orchestrator. Tokens come from plugin/tree_sync.py.
+# Colors: Anthropic models warm, OpenAI cool, Gemini yellow.
+[ui.sidebar.agents]
+rows = [
+  [{ token = "$space", bold = true, fg = "#cdd6f4" }, { token = "$tabl", dim = true }],
+  [
+    { token = "$branch", fg = "#585b70" },
+    "state_icon",
+    { token = "agent", rules = [
+      { equals = "claude", fg = "#d97757" },
+      { equals = "codex", fg = "#10a37f" },
+      { equals = "gemini", fg = "#4285f4" },
+    ] },
+  ],
+  [
+    { token = "$model", rules = [
+      { contains = "opus", fg = "#f38ba8" },
+      { contains = "sonnet", fg = "#fab387" },
+      { contains = "haiku", fg = "#a6e3a1" },
+      { contains = "gpt-6-astra", fg = "#cba6f7" },
+      { contains = "gpt-6.1-sol", fg = "#89b4fa" },
+      { contains = "gpt-6-sol", fg = "#89b4fa" },
+      { contains = "gpt-6-luna", fg = "#94e2d5" },
+      { contains = "gemini", fg = "#f9e2af" },
+    ] },
+  ],
+]
+
+# Subagents popup: live tree of every orchestrator and its children.
+[[keys.command]]
+key = "prefix+a"
+type = "popup"
+command = "python3 ~/.claude/skills/herdr-delegate/plugin/panel.py"
+description = "subagents panel"
+width = "60%"
+height = "70%"

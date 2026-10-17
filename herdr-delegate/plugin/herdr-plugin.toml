@@ -1,0 +1,53 @@
+id = "herdr-delegate.tree"
+name = "Delegate Tree"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Nest herdr-delegate subagents under their orchestrator in the Agents panel, plus a subagents popup"
+platforms = ["macos", "linux"]
+
+# Re-apply the tree sort and header tokens after a server restart.
+[[startup]]
+command = ["python3", "tree_sync.py"]
+
+# Keep top-level agents' $space/$tabl tokens current as things change.
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "tree_sync.py"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "tree_sync.py"]
+
+[[events]]
+on = "pane.moved"
+command = ["python3", "tree_sync.py"]
+
+[[events]]
+on = "workspace.renamed"
+command = ["python3", "tree_sync.py"]
+
+[[events]]
+on = "tab.renamed"
+command = ["python3", "tree_sync.py"]
+
+[[events]]
+on = "tab.created"
+command = ["python3", "tree_sync.py"]
+
+[[events]]
+on = "tab.closed"
+command = ["python3", "tree_sync.py"]
+
+[[actions]]
+id = "sync"
+title = "Refresh delegate tree"
+contexts = ["workspace"]
+command = ["python3", "tree_sync.py"]
+
+[[panes]]
+id = "panel"
+title = "Subagents"
+placement = "popup"
+width = "60%"
+height = "70%"
+command = ["python3", "panel.py"]
